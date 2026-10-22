@@ -1,0 +1,6 @@
+# Build output (rebuild with ./build.sh)
+fixmon.app/
+*.iconset/
+
+# macOS
+.DS_Store
