@@ -6,7 +6,9 @@
 set -e
 cd "$(dirname "$0")"
 APP=fixmon.app
-VERSION=1.2
+# Version: $VERSION if given (CI passes the tag), else the latest git tag, else "dev".
+VERSION=${VERSION:-$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')}
+VERSION=${VERSION:-dev}
 
 # App icon: regenerated only when the drawing script changes.
 ICNS=icon/AppIcon.icns

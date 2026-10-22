@@ -1,0 +1,63 @@
+# Pushing a tag like v1.3 builds fixmon on a GitHub macOS runner and publishes a release with the DMG.
+# Running it by hand (Actions → Release → Run workflow) only builds and uploads the DMG as an artifact.
+#
+# Signing: with the FIXMON_CERT_P12 / FIXMON_CERT_PASSWORD secrets set, the app is signed with the same
+# "fixmon local signing" identity as local builds, so the Accessibility grant survives updates.
+# Without them it falls back to ad-hoc signing (users must re-grant Accessibility after each update).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Import signing identity
+        env:
+          CERT_P12: ${{ secrets.FIXMON_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.FIXMON_CERT_PASSWORD }}
+        run: |
+          if [ -z "$CERT_P12" ]; then
+            echo "::warning::FIXMON_CERT_P12 not set; building ad-hoc signed"
+            exit 0
+          fi
+          KC="$RUNNER_TEMP/signing.keychain-db"
+          KC_PASS=$(openssl rand -base64 24)
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KC_PASS" "$KC"
+          security set-keychain-settings -lut 3600 "$KC"
+          security unlock-keychain -p "$KC_PASS" "$KC"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PASS" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/cert.p12"
+
+      - name: Build DMG
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then export VERSION="${GITHUB_REF_NAME#v}"; fi
+          ./build.sh dmg
+          codesign -dv fixmon.app 2>&1 | grep -E "Authority|Signature"
+
+      - name: Upload artifact
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fixmon-dmg
+          path: dist/*.dmg
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" "dist/fixmon-$V.dmg" --title "fixmon $V" \
+            --notes-file .github/release-notes.md --generate-notes
