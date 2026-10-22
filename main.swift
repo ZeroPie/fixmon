@@ -151,10 +151,29 @@ final class Preview {
         return w
     }()
 
+    private var visible = false
+
+    /// Fades in at the target (and glides between targets), fades out on nil.
     func show(_ rectCG: CGRect?) {
-        guard let r = rectCG else { window.orderOut(nil); return }
+        guard let r = rectCG else {
+            guard visible else { return }
+            visible = false
+            NSAnimationContext.runAnimationGroup({ $0.duration = 0.12; window.animator().alphaValue = 0 },
+                                                 completionHandler: { [weak self] in
+                                                     guard let self, !self.visible else { return }
+                                                     self.window.orderOut(nil)
+                                                 })
+            return
+        }
+        if visible {
+            NSAnimationContext.runAnimationGroup { $0.duration = 0.08; window.animator().setFrame(flipped(r), display: true) }
+            return
+        }
+        visible = true
+        window.alphaValue = 0
         window.setFrame(flipped(r), display: true)
         window.orderFrontRegardless()
+        NSAnimationContext.runAnimationGroup { $0.duration = 0.12; window.animator().alphaValue = 1 }
     }
 }
 
@@ -323,8 +342,9 @@ func axValue<T>(_ el: AXUIElement, _ attr: String, _ type: AXValueType, _ empty:
     var ref: CFTypeRef?
     guard AXUIElementCopyAttributeValue(el, attr as CFString, &ref) == .success, let v = ref,
           CFGetTypeID(v) == AXValueGetTypeID() else { return nil }
-    var out = empty
-    return AXValueGetValue(v as! AXValue, type, &out) ? out : nil
+    var out = empty // only ever a plain struct (CGPoint/CGSize), so writing its raw bytes is fine
+    let ok = withUnsafeMutableBytes(of: &out) { AXValueGetValue(v as! AXValue, type, $0.baseAddress!) }
+    return ok ? out : nil
 }
 
 func axString(_ el: AXUIElement, _ attr: String) -> String? {
@@ -719,6 +739,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        menu.addItem(withTitle: "fixmon \(version)", action: nil, keyEquivalent: "")
         menu.addItem(withTitle: "Accessibility: \(AXIsProcessTrusted() ? "granted" : "missing") · Mouse lock: \(eventTap != nil ? "active" : "inactive")",
                      action: nil, keyEquivalent: "")
         if !AXIsProcessTrusted() {
