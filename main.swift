@@ -12,6 +12,7 @@
 import AppKit
 import ApplicationServices
 import Carbon.HIToolbox
+import ServiceManagement
 
 let defaults = UserDefaults.standard
 defaults.register(defaults: [
@@ -175,7 +176,7 @@ let tapCallback: CGEventTapCallBack = { _, type, event, _ in
         // Only moves/drags reposition the cursor; re-posting a click would click twice.
         if type == .mouseMoved || type == .leftMouseDragged || type == .rightMouseDragged || type == .otherMouseDragged {
             let button = CGMouseButton(rawValue: UInt32(event.getIntegerValueField(.mouseEventButtonNumber))) ?? .left
-            DispatchQueue.main.async { moveCursor(to: p, type: type, button: button) }
+            moveCursor(to: p, type: type, button: button) // inline: a main-queue hop is a visible frame of lag
         }
         if type == .mouseMoved && p.y < visibleRectCG.minY { DispatchQueue.main.async { menuBarPush() } }
     }
@@ -277,8 +278,17 @@ func startMouseLock() -> Bool {
     let types: [CGEventType] = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged,
                                 .leftMouseDown, .leftMouseUp, .rightMouseDown, .otherMouseDown]
     let mask = types.reduce(CGEventMask(0)) { $0 | (1 << $1.rawValue) }
-    guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
-                                      eventsOfInterest: mask, callback: tapCallback, userInfo: nil) else {
+    // HID level sees moves before the window server places the cursor, so the clamp lands before the
+    // cursor is drawn inside the strip; the session level is the fallback.
+    var level = "HID"
+    var tap = CGEvent.tapCreate(tap: .cghidEventTap, place: .headInsertEventTap, options: .defaultTap,
+                                eventsOfInterest: mask, callback: tapCallback, userInfo: nil)
+    if tap == nil {
+        level = "session"
+        tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
+                                eventsOfInterest: mask, callback: tapCallback, userInfo: nil)
+    }
+    guard let tap else {
         log("event tap creation failed (AX trusted: \(AXIsProcessTrusted()))")
         return false
     }
@@ -286,7 +296,7 @@ func startMouseLock() -> Bool {
     CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
     CGEvent.tapEnable(tap: tap, enable: true)
     eventTap = tap
-    log("event tap active")
+    log("event tap active (\(level) level)")
     return true
 }
 
@@ -615,6 +625,26 @@ func registerHotKey() {
 
 // MARK: - App / menu bar
 
+/// Menu-bar glyph: a monitor with its left strip blacked out (template, so it follows light/dark).
+func statusIcon() -> NSImage {
+    let img = NSImage(size: NSSize(width: 18, height: 16), flipped: false) { _ in
+        let screen = NSRect(x: 1.5, y: 4.5, width: 15, height: 10)
+        let outline = NSBezierPath(roundedRect: screen, xRadius: 2, yRadius: 2)
+        outline.lineWidth = 1.5
+        NSColor.black.set()
+        outline.stroke()
+        NSGraphicsContext.saveGraphicsState()
+        outline.addClip()
+        NSRect(x: 0, y: 0, width: 6.5, height: 16).fill()
+        NSGraphicsContext.restoreGraphicsState()
+        NSRect(x: 8, y: 2, width: 2, height: 2.5).fill() // neck
+        NSBezierPath(roundedRect: NSRect(x: 5, y: 0.5, width: 8, height: 1.5), xRadius: 0.75, yRadius: 0.75).fill() // foot
+        return true
+    }
+    img.isTemplate = true
+    return img
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let overlay = Overlay()
     var statusItem: NSStatusItem!
@@ -626,7 +656,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ = AXIsProcessTrustedWithOptions(opts)
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.title = "◧"
+        statusItem.button?.image = statusIcon()
         let menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
@@ -670,8 +700,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        let name = targetScreen()?.localizedName ?? "no display"
-        menu.addItem(withTitle: "Dead zone: \(Int(deadWidth)) pt on \(name)", action: nil, keyEquivalent: "")
         menu.addItem(withTitle: "Accessibility: \(AXIsProcessTrusted() ? "granted" : "missing") · Mouse lock: \(eventTap != nil ? "active" : "inactive")",
                      action: nil, keyEquivalent: "")
         if !AXIsProcessTrusted() {
@@ -694,13 +722,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(item)
         }
         menu.addItem(.separator())
-        for (title, delta) in [("Wider  +50", 50.0), ("Wider  +10", 10.0), ("Narrower  −10", -10.0), ("Narrower  −50", -50.0)] {
-            let item = NSMenuItem(title: title, action: #selector(resize(_:)), keyEquivalent: "")
-            item.target = self
-            item.tag = Int(delta)
-            menu.addItem(item)
-        }
+        menu.addItem(widthSliderItem())
         menu.addItem(.separator())
+        let login = NSMenuItem(title: "Launch at login", action: #selector(toggleLogin), keyEquivalent: "")
+        login.target = self
+        login.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        menu.addItem(login)
         menu.addItem(withTitle: "Restart fixmon", action: #selector(restart), keyEquivalent: "r").target = self
         menu.addItem(withTitle: "Quit fixmon", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     }
@@ -711,9 +738,78 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         apply()
     }
 
-    @objc func resize(_ sender: NSMenuItem) {
-        defaults.set(max(0, deadWidth + CGFloat(sender.tag)), forKey: "deadWidth")
-        apply()
+    // MARK: Width slider
+
+    var widthLabel: NSTextField?
+    var widthSlider: NSSlider?
+    var widthApply: DispatchWorkItem?
+
+    /// "Dead zone" label over [−] slider [+]; the overlay follows live while dragging.
+    func widthSliderItem() -> NSMenuItem {
+        let maxWidth = displayRectCG.isNull ? 2000 : Double(displayRectCG.width) - 100
+        let view = NSView(frame: NSRect(x: 0, y: 0, width: 280, height: 48))
+
+        let label = NSTextField(labelWithString: "")
+        label.frame = NSRect(x: 20, y: 27, width: 250, height: 17)
+        label.font = .menuFont(ofSize: 0)
+        label.textColor = .secondaryLabelColor
+        view.addSubview(label)
+
+        let minus = NSButton(title: "−", target: self, action: #selector(nudgeWidth(_:)))
+        minus.tag = -5
+        let plus = NSButton(title: "+", target: self, action: #selector(nudgeWidth(_:)))
+        plus.tag = 5
+        for (b, x) in [(minus, 14.0), (plus, 246.0)] {
+            b.bezelStyle = .inline
+            b.frame = NSRect(x: x, y: 4, width: 22, height: 20)
+            view.addSubview(b)
+        }
+
+        let slider = NSSlider(value: Double(deadWidth), minValue: 0, maxValue: maxWidth, target: self, action: #selector(slideWidth(_:)))
+        slider.frame = NSRect(x: 40, y: 4, width: 202, height: 20)
+        slider.isContinuous = true
+        view.addSubview(slider)
+
+        widthLabel = label
+        widthSlider = slider
+        updateWidthLabel()
+        let item = NSMenuItem()
+        item.view = view
+        return item
+    }
+
+    func updateWidthLabel() {
+        widthLabel?.stringValue = "Dead zone: \(Int(deadWidth)) pt on \(targetScreen()?.localizedName ?? "no display")"
+    }
+
+    @objc func slideWidth(_ sender: NSSlider) {
+        setWidth((sender.doubleValue / 5).rounded() * 5)
+    }
+
+    @objc func nudgeWidth(_ sender: NSButton) {
+        setWidth(Double(deadWidth) + Double(sender.tag))
+        widthSlider?.doubleValue = Double(deadWidth)
+    }
+
+    func setWidth(_ w: Double) {
+        defaults.set(max(0, w), forKey: "deadWidth")
+        updateWidthLabel()
+        refreshGeometry()
+        overlay.update()
+        // Pushing every window on each slider tick is wasteful; do it once the slider settles.
+        widthApply?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.apply() }
+        widthApply = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+    }
+
+    @objc func toggleLogin() {
+        let svc = SMAppService.mainApp
+        do {
+            if svc.status == .enabled { try svc.unregister() } else { try svc.register() }
+        } catch {
+            log("launch at login: \(error)")
+        }
     }
 
     /// Relaunches the bundle (picks up a rebuilt binary too): a detached shell reopens it once we've quit.

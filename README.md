@@ -17,7 +17,11 @@ behaves as if that part of the screen doesn't exist.
 ```sh
 ./build.sh          # builds fixmon.app
 open fixmon.app
+./build.sh install  # or: install to /Applications and launch from there
 ```
+
+The menu has a dead-zone width slider (the overlay follows live), Launch at login, and Restart.
+The app icon is drawn by `icon/make_icon.swift`; `build.sh` regenerates `icon/AppIcon.icns` when it changes.
 
 Needs Accessibility access (System Settings → Privacy & Security → Accessibility). Signing with a
 local identity named "fixmon local signing" keeps that grant across rebuilds; otherwise it's ad-hoc.
