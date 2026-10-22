@@ -2,10 +2,11 @@
 # Builds fixmon.app (a bundle, so the Accessibility grant sticks to the app rather than your terminal).
 #   ./build.sh           build ./fixmon.app
 #   ./build.sh install   build, then install to /Applications and relaunch from there
+#   ./build.sh dmg       build, then package dist/fixmon-<version>.dmg (drag-to-Applications)
 set -e
 cd "$(dirname "$0")"
 APP=fixmon.app
-VERSION=1.1
+VERSION=1.2
 
 # App icon: regenerated only when the drawing script changes.
 ICNS=icon/AppIcon.icns
@@ -48,12 +49,26 @@ security find-identity -p codesigning | grep -q "$ID" || ID=-
 codesign --force --sign "$ID" "$APP"
 echo "Built $APP $VERSION"
 
-if [ "$1" = install ]; then
+case "$1" in
+install)
   pkill -x fixmon || true
   rm -rf "/Applications/$APP"
   cp -R "$APP" /Applications/
   open "/Applications/$APP"
   echo "Installed to /Applications and launched"
-else
-  echo "Run: open $APP   (or ./build.sh install)"
-fi
+  ;;
+dmg)
+  STAGE=$(mktemp -d)
+  cp -R "$APP" "$STAGE/"
+  ln -s /Applications "$STAGE/Applications"
+  mkdir -p dist
+  DMG="dist/fixmon-$VERSION.dmg"
+  rm -f "$DMG"
+  hdiutil create -quiet -volname "fixmon $VERSION" -srcfolder "$STAGE" -fs HFS+ -format UDZO "$DMG"
+  rm -rf "$STAGE"
+  echo "Packaged $DMG"
+  ;;
+*)
+  echo "Run: open $APP   (or ./build.sh install / ./build.sh dmg)"
+  ;;
+esac

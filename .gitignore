@@ -4,3 +4,4 @@ fixmon.app/
 
 # macOS
 .DS_Store
+dist/

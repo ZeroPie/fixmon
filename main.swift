@@ -47,7 +47,17 @@ private func writeLog(_ msg: String) {
 
 // MARK: - Display geometry
 
+/// Stable identity of a physical display (vendor-model-serial), so the choice survives rearranging and replugging.
+func displayKey(_ screen: NSScreen) -> String {
+    let id = displayID(screen)
+    return "\(CGDisplayVendorNumber(id))-\(CGDisplayModelNumber(id))-\(CGDisplaySerialNumber(id))"
+}
+
 func targetScreen() -> NSScreen? {
+    // A display picked from the menu wins; if it's unplugged, fence nothing rather than another screen.
+    if let key = defaults.string(forKey: "displayKey") {
+        return NSScreen.screens.first { displayKey($0) == key }
+    }
     let match = defaults.string(forKey: "displayMatch") ?? ""
     if !match.isEmpty, let s = NSScreen.screens.first(where: { $0.localizedName.localizedCaseInsensitiveContains(match) }) {
         return s
@@ -165,7 +175,7 @@ let tapCallback: CGEventTapCallBack = { _, type, event, _ in
     // Green button on the fenced display: fill the usable area instead of going full screen.
     // Option-click is left alone (it's the native zoom).
     if type == .leftMouseDown && defaults.bool(forKey: "fakeFullScreen") && displayRectCG.contains(p)
-        && !event.flags.contains(.maskAlternate), let win = fullScreenButtonWindow(at: p) {
+        && !event.flags.contains(.maskAlternate), let win = fullScreenButtonWindow(at: p), !isExcluded(win) {
         swallowNextMouseUp = true
         pushQueue.async { toggleFill(win) }
         return nil
@@ -256,7 +266,7 @@ func exitFullScreen(_ win: AXUIElement, attempt: Int = 0) {
     var pid: pid_t = 0
     AXUIElementGetPid(win, &pid)
     let app = NSRunningApplication(processIdentifier: pid)
-    if let id = app?.bundleIdentifier, fullScreenExempt.contains(id) { return }
+    if let id = app?.bundleIdentifier, fullScreenExempt.contains(id) || excludedApps.contains(id) { return }
     if attempt == 0 {
         guard !exitingFullScreen.contains(where: { CFEqual($0, win) }) else { return } // already on it
         exitingFullScreen.append(win)
@@ -357,6 +367,15 @@ func targetFrame(_ f: CGRect) -> CGRect? {
     return t.integral == f.integral ? nil : t
 }
 
+/// Bundle IDs the user excluded from the menu: their windows are never moved, re-tiled or taken out of full screen.
+var excludedApps: Set<String> { Set(defaults.stringArray(forKey: "excludedApps") ?? []) }
+
+func isExcluded(_ win: AXUIElement) -> Bool {
+    var pid: pid_t = 0
+    guard AXUIElementGetPid(win, &pid) == .success, let id = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier else { return false }
+    return excludedApps.contains(id)
+}
+
 /// Window kinds we move: regular windows, dialogs (alerts, Open/Save panels) and floating panels
 /// (inspectors, palettes). Sheets ride along with their parent; menus, popovers and tooltips are left alone.
 let movableSubroles: Set<String> = [kAXStandardWindowSubrole, kAXDialogSubrole, kAXSystemDialogSubrole,
@@ -364,7 +383,7 @@ let movableSubroles: Set<String> = [kAXStandardWindowSubrole, kAXDialogSubrole, 
 
 /// Frame of a movable, visible window, or nil for anything we shouldn't touch.
 func windowFrame(_ win: AXUIElement) -> CGRect? {
-    guard axString(win, kAXRoleAttribute) == kAXWindowRole,
+    guard !isExcluded(win), axString(win, kAXRoleAttribute) == kAXWindowRole,
           let sub = axString(win, kAXSubroleAttribute), movableSubroles.contains(sub),
           !axBool(win, kAXMinimizedAttribute), !axBool(win, "AXFullScreen"),
           let pos = axValue(win, kAXPositionAttribute, .cgPoint, CGPoint.zero),
@@ -723,7 +742,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         menu.addItem(.separator())
         menu.addItem(widthSliderItem())
+        menu.addItem(displayMenuItem())
+        menu.addItem(excludeMenuItem())
         menu.addItem(.separator())
+        menu.addItem(withTitle: "About fixmon", action: #selector(about), keyEquivalent: "").target = self
         let login = NSMenuItem(title: "Launch at login", action: #selector(toggleLogin), keyEquivalent: "")
         login.target = self
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -736,6 +758,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let key = sender.representedObject as? String else { return }
         defaults.set(!defaults.bool(forKey: key), forKey: key)
         apply()
+    }
+
+    // MARK: Display picker
+
+    func displayMenuItem() -> NSMenuItem {
+        let current = targetScreen()
+        let item = NSMenuItem(title: "Display: \(current?.localizedName ?? "not connected")", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        for screen in NSScreen.screens {
+            let builtin = CGDisplayIsBuiltin(displayID(screen)) != 0
+            let s = NSMenuItem(title: screen.localizedName + (builtin ? "  (built-in)" : ""), action: #selector(pickDisplay(_:)), keyEquivalent: "")
+            s.target = self
+            s.representedObject = displayKey(screen)
+            s.state = screen == current ? .on : .off
+            sub.addItem(s)
+        }
+        item.submenu = sub
+        return item
+    }
+
+    @objc func pickDisplay(_ sender: NSMenuItem) {
+        defaults.set(sender.representedObject as? String, forKey: "displayKey")
+        apply()
+    }
+
+    // MARK: Excluded apps
+
+    func excludeMenuItem() -> NSMenuItem {
+        let excluded = excludedApps
+        let item = NSMenuItem(title: excluded.isEmpty ? "Excluded apps" : "Excluded apps (\(excluded.count))", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        sub.addItem(withTitle: "Excluded apps' windows are left where they are.", action: nil, keyEquivalent: "")
+        sub.addItem(.separator())
+        // Running apps first, then excluded ones that aren't running (so they can still be un-excluded).
+        var seen = Set<String>()
+        let running = NSWorkspace.shared.runningApplications.filter(shouldManage)
+            .sorted { ($0.localizedName ?? "").localizedCaseInsensitiveCompare($1.localizedName ?? "") == .orderedAscending }
+        for app in running {
+            guard let id = app.bundleIdentifier, seen.insert(id).inserted else { continue }
+            sub.addItem(excludeItem(title: app.localizedName ?? id, id: id, icon: app.icon, on: excluded.contains(id)))
+        }
+        for id in excluded.subtracting(seen).sorted() {
+            sub.addItem(excludeItem(title: id, id: id, icon: nil, on: true))
+        }
+        item.submenu = sub
+        return item
+    }
+
+    func excludeItem(title: String, id: String, icon: NSImage?, on: Bool) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: #selector(toggleExclude(_:)), keyEquivalent: "")
+        item.target = self
+        item.representedObject = id
+        item.state = on ? .on : .off
+        if let icon = icon?.copy() as? NSImage {
+            icon.size = NSSize(width: 16, height: 16)
+            item.image = icon
+        }
+        return item
+    }
+
+    @objc func toggleExclude(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        var set = excludedApps
+        if set.contains(id) { set.remove(id) } else { set.insert(id) }
+        defaults.set(set.sorted(), forKey: "excludedApps")
+        apply()
+    }
+
+    @objc func about() {
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.orderFrontStandardAboutPanel(nil)
     }
 
     // MARK: Width slider

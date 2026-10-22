@@ -18,9 +18,18 @@ behaves as if that part of the screen doesn't exist.
 ./build.sh          # builds fixmon.app
 open fixmon.app
 ./build.sh install  # or: install to /Applications and launch from there
+./build.sh dmg      # or: package dist/fixmon-<version>.dmg to hand to someone
 ```
 
-The menu has a dead-zone width slider (the overlay follows live), Launch at login, and Restart.
+The menu has a dead-zone width slider (the overlay follows live), a display picker (remembered by
+hardware ID; if that display is unplugged nothing is fenced), per-app exclusions, Launch at login, and Restart.
+
+### Installing the DMG on another Mac
+
+fixmon isn't notarized (no paid Apple developer account), so Gatekeeper blocks the first launch.
+Drag fixmon to Applications, open it once, then System Settings → Privacy & Security → "Open Anyway".
+Or from a terminal: `xattr -dr com.apple.quarantine /Applications/fixmon.app`.
+Then grant Accessibility when asked.
 The app icon is drawn by `icon/make_icon.swift`; `build.sh` regenerates `icon/AppIcon.icns` when it changes.
 
 Needs Accessibility access (System Settings → Privacy & Security → Accessibility). Signing with a
