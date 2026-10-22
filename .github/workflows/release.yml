@@ -19,6 +19,8 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags, so manual builds get a real version
 
       - name: Import signing identity
         env:
