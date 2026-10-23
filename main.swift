@@ -13,6 +13,7 @@ import AppKit
 import ApplicationServices
 import Carbon.HIToolbox
 import ServiceManagement
+import Security
 
 let defaults = UserDefaults.standard
 defaults.register(defaults: [
@@ -23,6 +24,7 @@ defaults.register(defaults: [
     "windowPush": true,
     "menuPush": true,        // pushing into the strip along the menu bar opens the app menus
     "fakeFullScreen": true,  // green button / full screen on the fenced display fills the usable area instead
+    "autoUpdate": true,      // check GitHub releases once a day
 ])
 
 // MARK: - Logging
@@ -684,6 +686,172 @@ func statusIcon() -> NSImage {
     return img
 }
 
+// MARK: - Updates
+
+/// Installs newer GitHub releases in place. A download is only installed if it's signed by the same
+/// identity as the running copy (same designated requirement), which also keeps the Accessibility grant.
+enum Updater {
+    static let repo = "ZeroPie/fixmon"
+    static var current: String { Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev" }
+    static var available: Release? // set when a check finds something newer; shown in the menu
+    static var busy = false
+
+    struct Release { let version: String; let dmg: URL; let page: URL; let notes: String }
+
+    static func isNewer(_ a: String, than b: String) -> Bool {
+        let x = a.split(separator: ".").map { Int($0) ?? 0 }, y = b.split(separator: ".").map { Int($0) ?? 0 }
+        for i in 0..<max(x.count, y.count) where (i < x.count ? x[i] : 0) != (i < y.count ? y[i] : 0) {
+            return (i < x.count ? x[i] : 0) > (i < y.count ? y[i] : 0)
+        }
+        return false
+    }
+
+    /// Daily background check; quiet unless there's something new (and not skipped).
+    static func autoCheck() {
+        guard defaults.bool(forKey: "autoUpdate"), current != "dev", !busy else { return }
+        if let last = defaults.object(forKey: "lastUpdateCheck") as? Date, Date().timeIntervalSince(last) < 86400 { return }
+        check(manual: false)
+    }
+
+    static func check(manual: Bool) {
+        guard !busy else { return }
+        if current == "dev" {
+            if manual { alert("This is a development build", "Updates only apply to release builds. Build with a version tag, or install a release DMG.") }
+            return
+        }
+        busy = true
+        latest { release, error in
+            busy = false
+            defaults.set(Date(), forKey: "lastUpdateCheck")
+            guard let release else {
+                log("update check failed: \(error ?? "?")")
+                if manual { alert("Couldn't check for updates", error ?? "Unknown error.") }
+                return
+            }
+            guard isNewer(release.version, than: current) else {
+                available = nil
+                if manual { alert("fixmon is up to date", "You have the latest version, \(current).") }
+                return
+            }
+            available = release
+            log("update available: \(release.version)")
+            if !manual && defaults.string(forKey: "skippedVersion") == release.version { return }
+            offer(release, manual: manual)
+        }
+    }
+
+    static func latest(_ done: @escaping (Release?, String?) -> Void) {
+        var req = URLRequest(url: URL(string: "https://api.github.com/repos/\(repo)/releases/latest")!)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.timeoutInterval = 20
+        URLSession.shared.dataTask(with: req) { data, _, err in
+            var release: Release?
+            if let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let tag = json["tag_name"] as? String, let page = (json["html_url"] as? String).flatMap(URL.init(string:)),
+               let assets = json["assets"] as? [[String: Any]],
+               let dmg = assets.lazy.compactMap({ $0["browser_download_url"] as? String }).first(where: { $0.hasSuffix(".dmg") }).flatMap(URL.init(string:)) {
+                let notes = (json["body"] as? String ?? "").components(separatedBy: "## Install").first ?? ""
+                release = Release(version: tag.hasPrefix("v") ? String(tag.dropFirst()) : tag, dmg: dmg, page: page,
+                                  notes: notes.trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+            DispatchQueue.main.async { done(release, release == nil ? (err?.localizedDescription ?? "No release with a DMG found.") : nil) }
+        }.resume()
+    }
+
+    static func offer(_ r: Release, manual: Bool) {
+        let a = NSAlert()
+        a.messageText = "fixmon \(r.version) is available"
+        a.informativeText = "You have \(current)." + (r.notes.isEmpty ? "" : "\n\n" + String(r.notes.prefix(600)))
+        a.addButton(withTitle: "Install and Relaunch")
+        a.addButton(withTitle: "Later")
+        if !manual { a.addButton(withTitle: "Skip This Version") }
+        NSApp.activate(ignoringOtherApps: true)
+        switch a.runModal() {
+        case .alertFirstButtonReturn: install(r)
+        case .alertThirdButtonReturn: defaults.set(r.version, forKey: "skippedVersion")
+        default: break
+        }
+    }
+
+    static func install(_ r: Release) {
+        busy = true
+        log("downloading \(r.dmg)")
+        URLSession.shared.downloadTask(with: r.dmg) { file, _, err in
+            guard let file else { return fail(r, err?.localizedDescription ?? "Download failed.") }
+            let work = FileManager.default.temporaryDirectory.appendingPathComponent("fixmon-update-\(UUID().uuidString)")
+            let dmg = work.appendingPathComponent("update.dmg"), mount = work.appendingPathComponent("mnt")
+            let staged = work.appendingPathComponent("fixmon.app")
+            do {
+                try FileManager.default.createDirectory(at: mount, withIntermediateDirectories: true)
+                try FileManager.default.moveItem(at: file, to: dmg) // the download file is deleted once this callback returns
+            } catch { return fail(r, error.localizedDescription) }
+            DispatchQueue.global().async {
+                defer { try? FileManager.default.removeItem(at: work) }
+                guard run("/usr/bin/hdiutil", "attach", dmg.path, "-nobrowse", "-readonly", "-noautoopen", "-mountpoint", mount.path) else {
+                    return fail(r, "Couldn't open the disk image.")
+                }
+                let copied = run("/usr/bin/ditto", mount.appendingPathComponent("fixmon.app").path, staged.path)
+                _ = run("/usr/bin/hdiutil", "detach", mount.path, "-force")
+                guard copied else { return fail(r, "The disk image doesn't contain fixmon.app.") }
+                guard sameSigner(staged) else {
+                    return fail(r, "The download isn't signed by the same identity as this copy, so it wasn't installed.")
+                }
+                do {
+                    _ = try FileManager.default.replaceItemAt(Bundle.main.bundleURL, withItemAt: staged)
+                } catch { return fail(r, "Couldn't replace \(Bundle.main.bundlePath): \(error.localizedDescription)") }
+                log("updated to \(r.version); relaunching")
+                DispatchQueue.main.async { (NSApp.delegate as? AppDelegate)?.restart() }
+            }
+        }.resume()
+    }
+
+    /// True if `app` is validly signed and satisfies the running copy's designated requirement.
+    static func sameSigner(_ app: URL) -> Bool {
+        var me: SecCode?, meStatic: SecStaticCode?, req: SecRequirement?, other: SecStaticCode?
+        guard SecCodeCopySelf([], &me) == errSecSuccess, let me,
+              SecCodeCopyStaticCode(me, [], &meStatic) == errSecSuccess, let meStatic,
+              SecCodeCopyDesignatedRequirement(meStatic, [], &req) == errSecSuccess, let req,
+              SecStaticCodeCreateWithPath(app as CFURL, [], &other) == errSecSuccess, let other else { return false }
+        let flags = SecCSFlags(rawValue: kSecCSCheckAllArchitectures | kSecCSStrictValidate | kSecCSCheckNestedCode)
+        let status = SecStaticCodeCheckValidity(other, flags, req)
+        if status != errSecSuccess { log("update signature check failed: \(status)") }
+        return status == errSecSuccess
+    }
+
+    static func run(_ tool: String, _ args: String...) -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: tool)
+        p.arguments = args
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return false }
+        p.waitUntilExit()
+        return p.terminationStatus == 0
+    }
+
+    static func fail(_ r: Release, _ why: String) {
+        log("update failed: \(why)")
+        DispatchQueue.main.async {
+            busy = false
+            let a = NSAlert()
+            a.messageText = "Couldn't install fixmon \(r.version)"
+            a.informativeText = why + "\n\nYou can download it from the release page instead."
+            a.addButton(withTitle: "Open Release Page")
+            a.addButton(withTitle: "Cancel")
+            NSApp.activate(ignoringOtherApps: true)
+            if a.runModal() == .alertFirstButtonReturn { NSWorkspace.shared.open(r.page) }
+        }
+    }
+
+    static func alert(_ title: String, _ text: String) {
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = text
+        NSApp.activate(ignoringOtherApps: true)
+        a.runModal()
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let overlay = Overlay()
     var statusItem: NSStatusItem!
@@ -724,6 +892,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if needsTap && eventTap == nil { _ = startMouseLock() }
             _ = self
         }
+        // Update check shortly after launch, then hourly (it only hits the network once a day).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { Updater.autoCheck() }
+        Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { _ in Updater.autoCheck() }
         apply()
     }
 
@@ -768,6 +939,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(excludeMenuItem())
         menu.addItem(.separator())
         menu.addItem(withTitle: "About fixmon", action: #selector(about), keyEquivalent: "").target = self
+        let updateTitle = Updater.available.map { "Install fixmon \($0.version)…" } ?? "Check for Updates…"
+        menu.addItem(withTitle: updateTitle, action: #selector(checkForUpdates), keyEquivalent: "").target = self
+        let auto = NSMenuItem(title: "Check for updates automatically", action: #selector(toggle(_:)), keyEquivalent: "")
+        auto.target = self
+        auto.representedObject = "autoUpdate"
+        auto.state = defaults.bool(forKey: "autoUpdate") ? .on : .off
+        menu.addItem(auto)
         let login = NSMenuItem(title: "Launch at login", action: #selector(toggleLogin), keyEquivalent: "")
         login.target = self
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -916,6 +1094,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let work = DispatchWorkItem { [weak self] in self?.apply() }
         widthApply = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+    }
+
+    @objc func checkForUpdates() {
+        if let r = Updater.available, !Updater.busy { Updater.offer(r, manual: true) } else { Updater.check(manual: true) }
     }
 
     @objc func toggleLogin() {

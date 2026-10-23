@@ -3,4 +3,6 @@
 2. fixmon isn't notarized, so macOS blocks the first launch: open it once, then System Settings → Privacy & Security → **Open Anyway** (or `xattr -dr com.apple.quarantine /Applications/fixmon.app`).
 3. Grant Accessibility access when asked.
 
+Already on 1.4 or later? fixmon updates itself (menu → Check for Updates…).
+
 Requires macOS 13+ on Apple Silicon.

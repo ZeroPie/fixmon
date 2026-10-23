@@ -30,6 +30,13 @@ fixmon isn't notarized (no paid Apple developer account), so Gatekeeper blocks t
 Drag fixmon to Applications, open it once, then System Settings → Privacy & Security → "Open Anyway".
 Or from a terminal: `xattr -dr com.apple.quarantine /Applications/fixmon.app`.
 Then grant Accessibility when asked.
+
+### Updates
+
+fixmon checks GitHub releases once a day (and via "Check for Updates…" in the menu). An update is
+only installed if it's signed by the same identity as the running copy, so the Accessibility grant
+carries over and no Gatekeeper prompt appears. Releasing is just pushing a tag: `git tag v1.5 && git push origin v1.5`.
+
 The app icon is drawn by `icon/make_icon.swift`; `build.sh` regenerates `icon/AppIcon.icns` when it changes.
 
 Needs Accessibility access (System Settings → Privacy & Security → Accessibility). Signing with a
